@@ -218,8 +218,8 @@ func DiskSubresourceSchema() map[string]*schema.Schema {
 		"rdm_compatibility_mode": {
 			Type:         schema.TypeString,
 			Optional:     true,
-			Default:      "virtualMode",
-			Description:  "The RDM compatibility mode. Can be virtualMode or physicalMode. Default: virtualMode.",
+			Computed:     true,
+			Description:  "The RDM compatibility mode. Can be virtualMode or physicalMode. Only applies to RDM disks.",
 			ValidateFunc: validation.StringInSlice(rdmCompatibilityModeAllowedValues, false),
 		},
 	}
@@ -1996,7 +1996,11 @@ func (r *DiskSubresource) expandDiskSettings(disk *types.VirtualDisk) error {
 	// Handle RDM backing separately
 	if rdmBacking, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
 		rdmBacking.DiskMode = r.GetWithRestart("disk_mode").(string)
-		rdmBacking.CompatibilityMode = r.Get("rdm_compatibility_mode").(string)
+		compatMode := r.Get("rdm_compatibility_mode").(string)
+		if compatMode == "" {
+			compatMode = "virtualMode"
+		}
+		rdmBacking.CompatibilityMode = compatMode
 		rdmBacking.DeviceName = r.Get("rdm_device_name").(string)
 
 		// Set capacity for RDM if size is specified
@@ -2127,7 +2131,11 @@ func (r *DiskSubresource) assignBackingInfo(disk *types.VirtualDisk) error {
 	// Handle RDM backing
 	if rdmBacking, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
 		rdmBacking.DeviceName = r.Get("rdm_device_name").(string)
-		rdmBacking.CompatibilityMode = r.Get("rdm_compatibility_mode").(string)
+		compatMode := r.Get("rdm_compatibility_mode").(string)
+		if compatMode == "" {
+			compatMode = "virtualMode"
+		}
+		rdmBacking.CompatibilityMode = compatMode
 		rdmBacking.DiskMode = r.Get("disk_mode").(string)
 		rdmBacking.FileName = ds.Path("")
 		rdmBacking.Datastore = &dsref
