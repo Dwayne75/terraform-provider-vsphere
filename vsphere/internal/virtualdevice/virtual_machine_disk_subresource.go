@@ -1950,10 +1950,16 @@ func (r *DiskSubresource) Relocate(l object.VirtualDeviceList, clone bool) (type
 	if r.rdd.Id() == "" {
 		log.Printf("[DEBUG] %s: Adding additional options to relocator for cloning", r)
 
-		backing := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
-		backing.FileName = ds.Path("")
-		backing.Datastore = &dsref
-		relocate.DiskBackingInfo = backing
+		switch backing := disk.Backing.(type) {
+		case *types.VirtualDiskFlatVer2BackingInfo:
+			backing.FileName = ds.Path("")
+			backing.Datastore = &dsref
+			relocate.DiskBackingInfo = backing
+		case *types.VirtualDiskRawDiskMappingVer1BackingInfo:
+			backing.FileName = ds.Path("")
+			backing.Datastore = &dsref
+			relocate.DiskBackingInfo = backing
+		}
 	}
 
 	// Attach the SPBM storage policy if specified
