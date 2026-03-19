@@ -60,6 +60,11 @@ var diskSubresourceSharingAllowedValues = []string{
 	string(types.VirtualDiskSharingSharingMultiWriter),
 }
 
+var rdmCompatibilityModeAllowedValues = []string{
+	"virtualMode",
+	"physicalMode",
+}
+
 // DiskSubresourceSchema represents the schema for the disk sub-resource.
 func DiskSubresourceSchema() map[string]*schema.Schema {
 	s := map[string]*schema.Schema{
@@ -203,6 +208,19 @@ func DiskSubresourceSchema() map[string]*schema.Schema {
 			Default:     "scsi",
 			Optional:    true,
 			Description: "The type of controller the disk should be connected to. Must be 'scsi', 'sata', 'nvme', or 'ide'.",
+		},
+		// Raw Device Mapping (RDM) fields
+		"rdm_device_name": {
+			Type:        schema.TypeString,
+			Optional:    true,
+			Description: "The raw device name for an RDM disk (e.g., /vmfs/devices/disks/naa.xxx). When set, the disk is created as a Raw Device Mapping instead of a standard VMDK.",
+		},
+		"rdm_compatibility_mode": {
+			Type:         schema.TypeString,
+			Optional:     true,
+			Default:      "virtualMode",
+			Description:  "The RDM compatibility mode. Can be virtualMode or physicalMode. Default: virtualMode.",
+			ValidateFunc: validation.StringInSlice(rdmCompatibilityModeAllowedValues, false),
 		},
 	}
 	structure.MergeSchema(s, subresourceSchema())
@@ -1059,6 +1077,13 @@ func virtualDiskToSchemaPropsMap(disk *types.VirtualDisk) map[string]interface{}
 		m["datastore_id"] = backing.Datastore.Value
 		m["disk_mode"] = backing.DiskMode
 		m["write_through"] = backing.WriteThrough
+	} else if backing, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
+		if backing.Datastore != nil {
+			m["datastore_id"] = backing.Datastore.Value
+		}
+		m["disk_mode"] = backing.DiskMode
+		m["rdm_device_name"] = backing.DeviceName
+		m["rdm_compatibility_mode"] = backing.CompatibilityMode
 	}
 
 	return m
@@ -1261,17 +1286,18 @@ func DiskImportOperation(d *schema.ResourceData, l object.VirtualDeviceList) err
 		if ct != SubresourceControllerTypeSCSI && ct != SubresourceControllerTypeSATA && ct != SubresourceControllerTypeIDE && ct != SubresourceControllerTypeNVME {
 			return fmt.Errorf("disk.%d: unsupported controller type %s for disk %s", i, ct, addr)
 		}
-		// As one final validation, as we are no longer reading here, validate that
-		// this is a VMDK-backed virtual disk to make sure we aren't importing RDM
-		// disks or what not. The device should have already been validated as a
-		// virtual disk via SelectDisks.
-		if _, ok := device.(*types.VirtualDisk).Backing.(*types.VirtualDiskFlatVer2BackingInfo); !ok {
-			return fmt.Errorf(
-				"disk.%d: unsupported disk type at %s (expected flat VMDK version 2, got %T)",
-				i,
-				addr,
-				device.(*types.VirtualDisk).Backing,
-			)
+		// Validate that this is a supported virtual disk backing type.
+		// Supported types: flat VMDK v2, RDM v1.
+		diskBacking := device.(*types.VirtualDisk).Backing
+		if _, ok := diskBacking.(*types.VirtualDiskFlatVer2BackingInfo); !ok {
+			if _, ok := diskBacking.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); !ok {
+				return fmt.Errorf(
+					"disk.%d: unsupported disk type at %s (expected flat VMDK version 2 or RDM, got %T)",
+					i,
+					addr,
+					diskBacking,
+				)
+			}
 		}
 		m := make(map[string]interface{})
 		// Save information so that the next DiskRefreshOperation can pick this
@@ -1335,28 +1361,33 @@ func ReadDiskAttrsForDataSource(l object.VirtualDeviceList, d *schema.ResourceDa
 	var out []map[string]interface{}
 	for i, device := range devices {
 		disk := device.(*types.VirtualDisk)
-		backing, ok := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
-		if !ok {
-			return nil, fmt.Errorf("disk number %d has an unsupported backing type (expected flat VMDK version 2, got %T)", i, disk.Backing)
-		}
 		m := make(map[string]interface{})
-		var eager, thin bool
-		if backing.EagerlyScrub != nil {
-			eager = *backing.EagerlyScrub
-		}
-		if backing.ThinProvisioned != nil {
-			thin = *backing.ThinProvisioned
-		}
+
 		if di, ok := disk.DeviceInfo.(*types.Description); ok {
 			m["label"] = di.Label
 		} else {
 			m["label"] = fmt.Sprintf("Disk %d", i)
 		}
-
 		m["size"] = diskCapacityInGiB(disk)
-		m["eagerly_scrub"] = eager
-		m["thin_provisioned"] = thin
 		m["unit_number"] = disk.UnitNumber
+
+		switch backing := disk.Backing.(type) {
+		case *types.VirtualDiskFlatVer2BackingInfo:
+			var eager, thin bool
+			if backing.EagerlyScrub != nil {
+				eager = *backing.EagerlyScrub
+			}
+			if backing.ThinProvisioned != nil {
+				thin = *backing.ThinProvisioned
+			}
+			m["eagerly_scrub"] = eager
+			m["thin_provisioned"] = thin
+		case *types.VirtualDiskRawDiskMappingVer1BackingInfo:
+			m["eagerly_scrub"] = false
+			m["thin_provisioned"] = false
+		default:
+			return nil, fmt.Errorf("disk number %d has an unsupported backing type (expected flat VMDK version 2 or RDM, got %T)", i, disk.Backing)
+		}
 
 		out = append(out, m)
 	}
@@ -1452,6 +1483,10 @@ func (r *DiskSubresource) Read(l object.VirtualDeviceList) error {
 		if err := r.setSparseBackingProperties(b, disk, attach); err != nil {
 			return err
 		}
+	} else if b, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
+		if err := r.setRawDiskMappingProperties(b, disk); err != nil {
+			return err
+		}
 	} else {
 		return fmt.Errorf("disk backing at %s is of an unsupported type (type %T)", r.Get("device_address").(string), disk.Backing)
 	}
@@ -1536,6 +1571,30 @@ func (r *DiskSubresource) setSparseBackingProperties(b *types.VirtualDiskSparseV
 	}
 
 	log.Printf("[DEBUG] %s: Read finished (key and device address may have changed)", r)
+	return nil
+}
+
+func (r *DiskSubresource) setRawDiskMappingProperties(b *types.VirtualDiskRawDiskMappingVer1BackingInfo, disk *types.VirtualDisk) error {
+	r.Set("uuid", b.Uuid)
+	r.Set("disk_mode", b.DiskMode)
+	r.Set("rdm_device_name", b.DeviceName)
+	r.Set("rdm_compatibility_mode", b.CompatibilityMode)
+
+	if b.Datastore != nil {
+		r.Set("datastore_id", b.Datastore.Value)
+	}
+
+	// Parse the mapping file path
+	if b.FileName != "" {
+		dp := &object.DatastorePath{}
+		if ok := dp.FromString(b.FileName); ok && dp.Path != "" {
+			r.Set("path", dp.Path)
+		}
+	}
+
+	r.Set("size", diskCapacityInGiB(disk))
+
+	log.Printf("[DEBUG] %s: RDM disk read finished", r)
 	return nil
 }
 
@@ -1891,10 +1950,16 @@ func (r *DiskSubresource) Relocate(l object.VirtualDeviceList, clone bool) (type
 	if r.rdd.Id() == "" {
 		log.Printf("[DEBUG] %s: Adding additional options to relocator for cloning", r)
 
-		backing := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
-		backing.FileName = ds.Path("")
-		backing.Datastore = &dsref
-		relocate.DiskBackingInfo = backing
+		switch backing := disk.Backing.(type) {
+		case *types.VirtualDiskFlatVer2BackingInfo:
+			backing.FileName = ds.Path("")
+			backing.Datastore = &dsref
+			relocate.DiskBackingInfo = backing
+		case *types.VirtualDiskRawDiskMappingVer1BackingInfo:
+			backing.FileName = ds.Path("")
+			backing.Datastore = &dsref
+			relocate.DiskBackingInfo = backing
+		}
 	}
 
 	// Attach the SPBM storage policy if specified
@@ -1923,7 +1988,31 @@ func (r *DiskSubresource) String() string {
 // used during Create and Update to set attributes to those found in
 // configuration.
 func (r *DiskSubresource) expandDiskSettings(disk *types.VirtualDisk) error {
-	// Backing settings
+	// Handle RDM backing separately
+	if rdmBacking, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
+		rdmBacking.DiskMode = r.GetWithRestart("disk_mode").(string)
+		rdmBacking.CompatibilityMode = r.Get("rdm_compatibility_mode").(string)
+		rdmBacking.DeviceName = r.Get("rdm_device_name").(string)
+
+		// Set capacity for RDM if size is specified
+		if sizeVal := r.Get("size"); sizeVal != nil && sizeVal.(int) > 0 {
+			disk.CapacityInBytes = structure.GiBToByte(int64(sizeVal.(int)))
+			disk.CapacityInKB = disk.CapacityInBytes / 1024
+		}
+
+		alloc := &types.StorageIOAllocationInfo{
+			Limit:       structure.Int64Ptr(int64(r.Get("io_limit").(int))),
+			Reservation: structure.Int32Ptr(int32(r.Get("io_reservation").(int))),
+			Shares: &types.SharesInfo{
+				Shares: int32(r.Get("io_share_count").(int)),
+				Level:  types.SharesLevel(r.Get("io_share_level").(string)),
+			},
+		}
+		disk.StorageIOAllocation = alloc
+		return nil
+	}
+
+	// Standard VMDK backing settings
 	b := disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo)
 	b.DiskMode = r.GetWithRestart("disk_mode").(string)
 	b.WriteThrough = structure.BoolPtr(r.GetWithRestart("write_through").(bool))
@@ -1971,10 +2060,23 @@ func (r *DiskSubresource) expandDiskSettings(disk *types.VirtualDisk) error {
 	return nil
 }
 
+// isRDM returns true if the disk is configured as a Raw Device Mapping.
+func (r *DiskSubresource) isRDM() bool {
+	if v := r.Get("rdm_device_name"); v != nil {
+		return v.(string) != ""
+	}
+	return false
+}
+
 // createDisk performs all of the logic for a base virtual disk creation.
 func (r *DiskSubresource) createDisk(l object.VirtualDeviceList) (*types.VirtualDisk, error) {
 	disk := new(types.VirtualDisk)
-	disk.Backing = new(types.VirtualDiskFlatVer2BackingInfo)
+
+	if r.isRDM() {
+		disk.Backing = new(types.VirtualDiskRawDiskMappingVer1BackingInfo)
+	} else {
+		disk.Backing = new(types.VirtualDiskFlatVer2BackingInfo)
+	}
 
 	// Only assign backing info if a datastore cluster is not specified. If one
 	// is, skip this step.
@@ -2017,6 +2119,17 @@ func (r *DiskSubresource) assignBackingInfo(disk *types.VirtualDisk) error {
 	}
 	dsref := ds.Reference()
 
+	// Handle RDM backing
+	if rdmBacking, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
+		rdmBacking.DeviceName = r.Get("rdm_device_name").(string)
+		rdmBacking.CompatibilityMode = r.Get("rdm_compatibility_mode").(string)
+		rdmBacking.DiskMode = r.Get("disk_mode").(string)
+		rdmBacking.FileName = ds.Path("")
+		rdmBacking.Datastore = &dsref
+		return nil
+	}
+
+	// Standard VMDK backing
 	var diskName string
 	if r.Get("attach").(bool) {
 		// No path interpolation is performed any more for attached disks - the
@@ -2410,6 +2523,9 @@ func diskUUIDMatch(device types.BaseVirtualDevice, uuid string) bool {
 		return backing.Uuid == uuid
 	}
 	if backing, ok := disk.Backing.(*types.VirtualDiskSparseVer2BackingInfo); ok {
+		return backing.Uuid == uuid
+	}
+	if backing, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
 		return backing.Uuid == uuid
 	}
 
