@@ -2578,14 +2578,24 @@ func (r *DiskSubresource) findVirtualDisk(l object.VirtualDeviceList, fallback b
 }
 
 func (r *DiskSubresource) findVirtualDiskByUUIDOrAddress(l object.VirtualDeviceList, fallback bool) (types.BaseVirtualDevice, error) {
+	// Try device key first — it's always unique and works for all disk types
+	// including physical RDM disks which have no UUID.
+	if key := r.Get("key"); key != nil && key.(int) > 0 {
+		device := l.FindByKey(int32(key.(int)))
+		if device != nil {
+			return device, nil
+		}
+	}
+
+	// Fall back to UUID matching
 	var uuid string
 	if v := r.Get("uuid"); v != nil {
 		uuid = v.(string)
 	}
-	switch {
-	case uuid == "" && fallback:
-		return r.FindVirtualDevice(l)
-	case uuid == "" && !fallback:
+	if uuid == "" {
+		if fallback {
+			return r.FindVirtualDevice(l)
+		}
 		return nil, errors.New("disk UUID is missing")
 	}
 	devices := l.Select(func(device types.BaseVirtualDevice) bool {
@@ -2595,7 +2605,6 @@ func (r *DiskSubresource) findVirtualDiskByUUIDOrAddress(l object.VirtualDeviceL
 	case len(devices) < 1:
 		return nil, fmt.Errorf("virtual disk with UUID %s not found", uuid)
 	case len(devices) > 1:
-		// This is an edge/should never happen case
 		return nil, fmt.Errorf("multiple virtual disks with UUID %s found", uuid)
 	}
 	return devices[0], nil
