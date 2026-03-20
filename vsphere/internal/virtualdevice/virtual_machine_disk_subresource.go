@@ -447,7 +447,7 @@ func DiskRefreshOperation(d *schema.ResourceData, c *govmomi.Client, l object.Vi
 				device := devices[i]
 				if device.GetVirtualDevice().Key == int32(r.Get("key").(int)) {
 					devices = append(devices[:i], devices[i+1:]...)
-					i--
+					break
 				}
 			}
 		}
@@ -487,6 +487,7 @@ func DiskRefreshOperation(d *schema.ResourceData, c *govmomi.Client, l object.Vi
 			newSet = append(newSet, r.Data())
 			devices = append(devices[:i], devices[i+1:]...)
 			i--
+			break
 		}
 	}
 	log.Printf("[DEBUG] DiskRefreshOperation: Resource set to write after known device search: %s", subresourceListString(newSet))
