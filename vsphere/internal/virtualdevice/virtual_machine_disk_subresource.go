@@ -323,7 +323,7 @@ func diskApplyOperationDelete(
 		if name, err = getDiskLabel(newData); err != nil {
 			return err
 		}
-		if (name == diskDeletedName || name == diskDetachedName) && oldData["uuid"] == newData["uuid"] {
+		if (name == diskDeletedName || name == diskDetachedName) && diskSubresourceMatch(oldData, newData) {
 			didx = newI
 			break
 		}
@@ -365,7 +365,7 @@ func diskApplyOperationCreateUpdate(
 	}
 	for _, oe := range oldDataSet {
 		oldData := oe.(map[string]interface{})
-		if newData["uuid"] == oldData["uuid"] {
+		if diskSubresourceMatch(newData, oldData) {
 			// This is an update
 			r := NewDiskSubresource(c, d, newData, oldData, index)
 			// If the only thing changing here is the datastore, or keep_on_remove,
@@ -2608,6 +2608,21 @@ func (r *DiskSubresource) findVirtualDiskByUUIDOrAddress(l object.VirtualDeviceL
 		return nil, fmt.Errorf("multiple virtual disks with UUID %s found", uuid)
 	}
 	return devices[0], nil
+}
+
+// diskSubresourceMatch correlates two disk sub-resource data maps.
+// Uses UUID when available (VMDK and virtual-mode RDM disks).
+// Falls back to device key when both UUIDs are empty (physical-mode RDM).
+func diskSubresourceMatch(a, b map[string]interface{}) bool {
+	uuidA, _ := a["uuid"].(string)
+	uuidB, _ := b["uuid"].(string)
+	if uuidA != "" || uuidB != "" {
+		return uuidA == uuidB
+	}
+	// Both UUIDs empty — match by device key instead.
+	keyA, _ := a["key"].(int)
+	keyB, _ := b["key"].(int)
+	return keyA > 0 && keyA == keyB
 }
 
 func diskUUIDMatch(device types.BaseVirtualDevice, uuid string) bool {
