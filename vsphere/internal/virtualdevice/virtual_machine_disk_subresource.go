@@ -1083,7 +1083,7 @@ func virtualDiskToSchemaPropsMap(disk *types.VirtualDisk) map[string]interface{}
 			m["datastore_id"] = backing.Datastore.Value
 		}
 		m["disk_mode"] = backing.DiskMode
-		m["rdm_device_name"] = backing.DeviceName
+		m["rdm_device_name"] = normalizeRDMDeviceName(backing.DeviceName)
 		m["rdm_compatibility_mode"] = backing.CompatibilityMode
 	}
 
@@ -1578,7 +1578,7 @@ func (r *DiskSubresource) setSparseBackingProperties(b *types.VirtualDiskSparseV
 func (r *DiskSubresource) setRawDiskMappingProperties(b *types.VirtualDiskRawDiskMappingVer1BackingInfo, disk *types.VirtualDisk) error {
 	r.Set("uuid", b.Uuid)
 	r.Set("disk_mode", b.DiskMode)
-	r.Set("rdm_device_name", b.DeviceName)
+	r.Set("rdm_device_name", normalizeRDMDeviceName(b.DeviceName))
 	r.Set("rdm_compatibility_mode", b.CompatibilityMode)
 
 	if b.Datastore != nil {
@@ -2575,6 +2575,38 @@ func diskUUIDMatch(device types.BaseVirtualDevice, uuid string) bool {
 
 // diskCapacityInGiB reports the supplied disk's capacity, by first checking
 // CapacityInBytes, and then falling back to CapacityInKB if that value is
+// normalizeRDMDeviceName converts ESXi vml-style device names to the
+// standard /vmfs/devices/disks/naa. format. ESXi internally stores device
+// names like "vml.0200f40000624a9370..." but users and storage APIs work
+// with "naa.624a9370..." or "/vmfs/devices/disks/naa.624a9370..." format.
+// The NAA identifier is embedded in the vml name after a type/LUN prefix.
+func normalizeRDMDeviceName(deviceName string) string {
+	if deviceName == "" {
+		return deviceName
+	}
+	// Already in naa format - normalize to full path
+	if strings.HasPrefix(deviceName, "/vmfs/devices/disks/naa.") {
+		return deviceName
+	}
+	if strings.HasPrefix(deviceName, "naa.") {
+		return "/vmfs/devices/disks/" + deviceName
+	}
+	// Convert vml format to naa format
+	// vml names look like: vml.0200XX0000<naa_id><extra_bytes>
+	// The NAA ID (Pure Storage) starts with 624a9370 and is 32 hex chars
+	if strings.HasPrefix(deviceName, "vml.") {
+		raw := deviceName[4:] // strip "vml."
+		// Look for the Pure Storage OUI "624a9370" in the raw hex
+		idx := strings.Index(raw, "624a9370")
+		if idx >= 0 && len(raw) >= idx+32 {
+			naaID := raw[idx : idx+32]
+			return "/vmfs/devices/disks/naa." + naaID
+		}
+	}
+	// Unknown format, return as-is
+	return deviceName
+}
+
 // unavailable. This helps correct some situations where the former value's
 // data gets cleared, which seems to happen on upgrades.
 func diskCapacityInGiB(disk *types.VirtualDisk) int {
