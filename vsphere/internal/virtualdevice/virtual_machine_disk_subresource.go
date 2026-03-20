@@ -493,6 +493,53 @@ func DiskRefreshOperation(d *schema.ResourceData, c *govmomi.Client, l object.Vi
 	log.Printf("[DEBUG] DiskRefreshOperation: Resource set to write after known device search: %s", subresourceListString(newSet))
 	log.Printf("[DEBUG] DiskRefreshOperation: Probable orphaned disk devices: %s", DeviceListString(devices))
 
+	// Second pass: match remaining devices by vSphere device key.
+	// Physical RDM disks have no UUID, so UUID matching above skips them.
+	// The device key (e.g. 2003, 2018) is unique per disk and stable across reads.
+	log.Printf("[DEBUG] DiskRefreshOperation: Looking for devices matchable by key")
+	for i := 0; i < len(devices); i++ {
+		device := devices[i]
+		deviceKey := int(device.GetVirtualDevice().Key)
+		matched := false
+		for n, item := range curSet {
+			m := item.(map[string]interface{})
+			if m["key"].(int) < 1 {
+				continue
+			}
+			if m["key"].(int) != deviceKey {
+				continue
+			}
+			// Check this state entry wasn't already consumed
+			alreadyUsed := false
+			for _, ns := range newSet {
+				nm := ns.(map[string]interface{})
+				if nm["key"].(int) == deviceKey {
+					alreadyUsed = true
+					break
+				}
+			}
+			if alreadyUsed {
+				continue
+			}
+			r := NewDiskSubresource(c, d, m, nil, n)
+			if err := r.Read(l); err != nil {
+				return fmt.Errorf("%s: %s", r.Addr(), err)
+			}
+			if strings.HasPrefix(r.Get("label").(string), diskOrphanedPrefix) {
+				continue
+			}
+			newSet = append(newSet, r.Data())
+			devices = append(devices[:i], devices[i+1:]...)
+			i--
+			matched = true
+			break
+		}
+		if matched {
+			log.Printf("[DEBUG] DiskRefreshOperation: Matched device by key %d", deviceKey)
+		}
+	}
+	log.Printf("[DEBUG] DiskRefreshOperation: Devices remaining after key matching: %s", DeviceListString(devices))
+
 	// Finally, any device that is still here is orphaned. They should be added
 	// as new devices.
 	log.Printf("[DEBUG] DiskRefreshOperation: Adding orphaned devices")
@@ -2567,11 +2614,19 @@ func diskUUIDMatch(device types.BaseVirtualDevice, uuid string) bool {
 		return backing.Uuid == uuid
 	}
 	if backing, ok := disk.Backing.(*types.VirtualDiskRawDiskMappingVer1BackingInfo); ok {
-		return backing.Uuid == uuid
+		// Physical RDM disks have no VMDK, so UUID is empty.
+		// UUID matching still works for virtual mode RDM which does have a UUID.
+		if backing.Uuid != "" || uuid != "" {
+			return backing.Uuid == uuid
+		}
+		// Both empty — can't match by UUID alone, skip so the caller
+		// can use an alternative matching strategy.
+		return false
 	}
 
 	return false
 }
+
 
 // diskCapacityInGiB reports the supplied disk's capacity, by first checking
 // CapacityInBytes, and then falling back to CapacityInKB if that value is
