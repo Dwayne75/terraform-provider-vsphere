@@ -380,6 +380,7 @@ func diskApplyOperationCreateUpdate(
 			oldCopy := omc.(map[string]interface{})
 			oldCopy["datastore_id"] = newData["datastore_id"]
 			oldCopy["keep_on_remove"] = newData["keep_on_remove"]
+			oldCopy["rdm_compatibility_mode"] = newData["rdm_compatibility_mode"]
 			if reflect.DeepEqual(oldCopy, newData) {
 				*updates = append(*updates, r.Data())
 				return nil
@@ -2261,6 +2262,10 @@ func (r *DiskSubresource) assignDisk(l object.VirtualDeviceList, disk *types.Vir
 		for _, device := range l {
 			d := device.GetVirtualDevice()
 			if d.ControllerKey != ckey || d.UnitNumber == nil {
+				continue
+			}
+			// Skip the disk being updated — it's allowed to keep its own slot.
+			if d.Key == disk.Key {
 				continue
 			}
 			units[*d.UnitNumber] = true
