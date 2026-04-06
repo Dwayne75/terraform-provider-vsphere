@@ -1817,10 +1817,12 @@ func (r *DiskSubresource) DiffGeneral() error {
 	switch r.Get("controller_type").(string) {
 	case "scsi":
 		ctlrCount := r.rdd.Get("scsi_controller_count").(int)
-		maxUnit := ctlrCount*15 - 1
+		scsiType := r.rdd.Get("scsi_type").(string)
+		usable := scsiUsableUnitsPerController(scsiType)
+		maxUnit := ctlrCount*usable - 1
 		currentUnit := r.Get("unit_number").(int)
 		if currentUnit > maxUnit {
-			return fmt.Errorf("unit_number on disk %q too high (%d) - maximum value is %d with %d SCSI controller(s)", name, currentUnit, maxUnit, ctlrCount)
+			return fmt.Errorf("unit_number on disk %q too high (%d) - maximum value is %d with %d SCSI controller(s) of type %s", name, currentUnit, maxUnit, ctlrCount, scsiType)
 		}
 	case "sata":
 		ctlrCount := r.rdd.Get("sata_controller_count").(int)
@@ -2237,10 +2239,10 @@ func (r *DiskSubresource) assignDisk(l object.VirtualDeviceList, disk *types.Vir
 	switch r.Get("controller_type").(string) {
 	case "scsi":
 		// Figure out the bus number, and look up the SCSI controller that matches.
-		// Always use 15 as the multiplier for unit number encoding, matching the
-		// Terraform config convention (scsi_controller * 15 + scsi_unit) and the
-		// upstream provider. This is consistent regardless of controller sub-type.
-		usable := 15
+		// The number of usable slots per controller depends on the SCSI
+		// controller sub-type (15 for LSI Logic/SAS, 63 for PVSCSI).
+		scsiType := r.rdd.Get("scsi_type").(string)
+		usable := scsiUsableUnitsPerController(scsiType)
 		bus := number / usable
 		// Also determine the unit number on that controller.
 		unit := int32(math.Mod(float64(number), float64(usable)))
@@ -2251,8 +2253,8 @@ func (r *DiskSubresource) assignDisk(l object.VirtualDeviceList, disk *types.Vir
 			return nil, err
 		}
 
-		// Build the unit list. Use 16 slots (15 usable + 1 controller unit).
-		units := make([]bool, 16)
+		// Build the unit list. Total slots = usable + 1 (reserved controller unit).
+		units := make([]bool, usable+1)
 		// Reserve the SCSI unit number
 		scsiUnit := ctlr.(types.BaseVirtualSCSIController).GetVirtualSCSIController().ScsiCtlrUnitNumber
 		units[scsiUnit] = true
@@ -2404,11 +2406,11 @@ func (r *Subresource) findControllerInfo(l object.VirtualDeviceList, disk *types
 		if unit > sc.GetVirtualSCSIController().ScsiCtlrUnitNumber {
 			unit--
 		}
-		// Use a fixed multiplier of 15 for unit number encoding regardless
-		// of controller type. This matches the convention used by Terraform
-		// configs (scsi_controller * 15 + scsi_unit) and the upstream provider.
-		// The PVSCSI capacity (64 devices) is handled in assignDisk validation.
-		unit += 15 * sc.GetVirtualSCSIController().BusNumber
+		// Use controller-type-aware multiplier for unit number encoding.
+		// PVSCSI supports 63 usable units per controller, LSI Logic/SAS 15.
+		scsiType := r.rdd.Get("scsi_type").(string)
+		usable := int32(scsiUsableUnitsPerController(scsiType))
+		unit += usable * sc.GetVirtualSCSIController().BusNumber
 		return int(unit), ctlr.(types.BaseVirtualController), nil
 	case types.BaseVirtualSATAController:
 		unit := *disk.UnitNumber
